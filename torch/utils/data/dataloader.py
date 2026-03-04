@@ -77,7 +77,25 @@ logger = logging.getLogger(__name__)
 
 _persistent_workers_atexit_lock = threading.Lock()
 _persistent_workers_atexit_registered = False
-_persistent_workers_atexit: weakref.WeakSet[Any] = weakref.WeakSet()
+_persistent_workers_atexit: weakref.WeakSet[_MultiProcessingDataLoaderIter] = (
+    weakref.WeakSet()
+)
+
+
+def _reset_persistent_workers_atexit_after_fork() -> None:
+    global _persistent_workers_atexit_lock, _persistent_workers_atexit
+
+    # Fork children inherit the atexit callback registration itself. Reset the
+    # registry state they should not share with the parent, including the lock
+    # that may have been held across fork.
+    _persistent_workers_atexit_lock = threading.Lock()
+    _persistent_workers_atexit = weakref.WeakSet()
+
+
+try:
+    os.register_at_fork(after_in_child=_reset_persistent_workers_atexit_after_fork)
+except AttributeError:
+    pass
 
 
 class _DatasetKind:
@@ -1153,6 +1171,9 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
 
         # No certainty which module multiprocessing_context is
         self._worker_result_queue = multiprocessing_context.Queue()  # type: ignore[var-annotated]
+        # Forked children inherit this iterator and its atexit registrations, but
+        # only the creating process owns the multiprocessing resources.
+        self._shutdown_owner_pid = os.getpid()
         self._worker_pids_set = False
         self._shutdown = False
         self._workers_done_event = multiprocessing_context.Event()
@@ -1240,7 +1261,7 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
         # atexit is used to shutdown thread and child processes in the
         # right sequence before main process exits
         if self._persistent_workers and self._pin_memory:
-            self._register_persistent_workers_atexit(self._workers)
+            self._register_persistent_workers_atexit()
 
         # .pid can be None only before process is spawned (not the case, so ignore)
         _utils.signal_handling._set_worker_pids(
@@ -1637,6 +1658,8 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
         ):
             # See (2) of the note. If Python is shutting down, do no-op.
             return
+        if getattr(self, "_shutdown_owner_pid", os.getpid()) != os.getpid():
+            return
         # Normal exit when last reference is gone / iterator is depleted.
         # See (1) and the second half of the note.
         if not self._shutdown:
@@ -1698,40 +1721,24 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
                         # we kill the worker.
                         w.terminate()
                         w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
-                    with contextlib.suppress(Exception):
+                    if not w.is_alive():
                         w.close()
-
-    # staticmethod is used to remove reference to `_MultiProcessingDataLoaderIter`
-    @staticmethod
-    def _clean_up_worker(w) -> None:
-        with contextlib.suppress(ValueError):
-            w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
-        try:
-            if w.is_alive():
-                w.terminate()
-                with contextlib.suppress(ValueError):
-                    w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
-        except ValueError:
-            pass
-        finally:
-            with contextlib.suppress(Exception):
-                w.close()
 
     @staticmethod
     def _clean_up_persistent_workers_atexit() -> None:
+        # This callback is registered after `_utils._set_python_exit_flag`,
+        # so it runs while `_shutdown_workers()` can still use multiprocessing.
         with _persistent_workers_atexit_lock:
-            workers = tuple(_persistent_workers_atexit)
-        for worker in workers:
-            _MultiProcessingDataLoaderIter._clean_up_worker(worker)
+            iterators = tuple(_persistent_workers_atexit)
+        for iterator in iterators:
+            iterator._shutdown_workers()
 
-    @staticmethod
-    def _register_persistent_workers_atexit(workers) -> None:
+    def _register_persistent_workers_atexit(self) -> None:
         import atexit
 
         global _persistent_workers_atexit_registered
         with _persistent_workers_atexit_lock:
-            for worker in workers:
-                _persistent_workers_atexit.add(worker)
+            _persistent_workers_atexit.add(self)
             if _persistent_workers_atexit_registered:
                 return
             atexit.register(

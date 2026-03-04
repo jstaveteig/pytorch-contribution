@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 import warnings
+from unittest import mock
 
 import torch
 import torch.utils.data.datapipes as dp
@@ -1104,10 +1105,10 @@ def _test_get_worker_info():
         worker_init_fn=_test_worker_info_init_fn,
     )
     it = iter(dataloader)
+    worker_pids = [w.pid for w in it._workers]
     data = []
     for d in it:
         data.append(d)  # noqa: PERF402
-    worker_pids = [w.pid for w in it._workers]
     data = torch.cat(data, 0)
     for d in data:
         # each `d` is a [worker_id, worker_pid] pair, which is set in
@@ -1127,6 +1128,12 @@ def _test_get_worker_info():
     except AttributeError:
         return
     raise RuntimeError("Expected AttributeError")
+
+
+def _test_persistent_workers_atexit_state_resets_after_fork(conn):
+    dataloader._MultiProcessingDataLoaderIter._clean_up_persistent_workers_atexit()
+    conn.send(len(tuple(dataloader._persistent_workers_atexit)))
+    conn.close()
 
 
 # test custom init function
@@ -3392,31 +3399,73 @@ except RuntimeError as e:
     @unittest.skipIf(not TEST_CUDA, "pin_memory requires CUDA")
     def test_persistent_workers_pin_memory_atexit_registered_once(self):
         import atexit
-        from unittest import mock
+        import weakref
 
-        target_fn = dataloader._MultiProcessingDataLoaderIter._clean_up_persistent_workers_atexit
-        register_call_count = 0
-        orig_register = atexit.register
+        cleanup_callback = dataloader._MultiProcessingDataLoaderIter._clean_up_persistent_workers_atexit
+        register_spy = mock.Mock(wraps=atexit.register)
+        persistent_workers_atexit = weakref.WeakSet()
 
-        def wrapped_register(fn, *args, **kwargs):
-            nonlocal register_call_count
-            if fn is target_fn:
-                register_call_count += 1
-            return orig_register(fn, *args, **kwargs)
-
-        with mock.patch("atexit.register", side_effect=wrapped_register):
+        with (
+            mock.patch("atexit.register", register_spy),
+            mock.patch.object(
+                dataloader, "_persistent_workers_atexit_registered", False
+            ),
+            mock.patch.object(
+                dataloader, "_persistent_workers_atexit", persistent_workers_atexit
+            ),
+        ):
             for _ in range(8):
                 loader = self._get_data_loader(
                     self.dataset, batch_size=2, num_workers=1, pin_memory=True
                 )
                 it = iter(loader)
                 next(it)
-                it._shutdown_workers()
+                loader_ref = weakref.ref(loader)
+                it_ref = weakref.ref(it)
                 del it
                 del loader
                 gc.collect()
+                self.assertIsNone(it_ref())
+                self.assertIsNone(loader_ref())
 
-        self.assertEqual(register_call_count, 1)
+        self.assertEqual(len(persistent_workers_atexit), 0)
+        self.assertEqual(
+            sum(
+                1
+                for call in register_spy.call_args_list
+                if call.args and call.args[0] is cleanup_callback
+            ),
+            1,
+        )
+
+    @unittest.skipIf(not TEST_CUDA, "pin_memory requires CUDA")
+    def test_persistent_workers_pin_memory_atexit_uses_iterator_shutdown(self):
+        import weakref
+
+        with (
+            mock.patch.object(
+                dataloader, "_persistent_workers_atexit_registered", True
+            ),
+            mock.patch.object(
+                dataloader, "_persistent_workers_atexit", weakref.WeakSet()
+            ),
+        ):
+            loader = self._get_data_loader(
+                self.dataset, batch_size=2, num_workers=1, pin_memory=True
+            )
+            it = iter(loader)
+            next(it)
+
+            shutdown_workers_spy = mock.Mock(wraps=it._shutdown_workers)
+
+            with mock.patch.object(
+                it,
+                "_shutdown_workers",
+                shutdown_workers_spy,
+            ):
+                dataloader._MultiProcessingDataLoaderIter._clean_up_persistent_workers_atexit()
+
+            self.assertEqual(shutdown_workers_spy.call_count, 1)
 
     @unittest.skipIf(not HAS_PSUTIL, "psutil not found")
     @unittest.skipIf(not IS_LINUX, "fd counting is only reliable on Linux")
@@ -3424,7 +3473,9 @@ except RuntimeError as e:
     def test_persistent_workers_pin_memory_fd_does_not_grow_linearly(self):
         proc = psutil.Process()
 
-        def make_and_destroy_loader() -> None:
+        def run_loader_once() -> None:
+            import weakref
+
             loader = self._get_data_loader(
                 self.dataset,
                 batch_size=2,
@@ -3433,18 +3484,70 @@ except RuntimeError as e:
             )
             it = iter(loader)
             next(it)
-            it._shutdown_workers()
+            loader_ref = weakref.ref(loader)
+            it_ref = weakref.ref(it)
             del it
             del loader
             gc.collect()
+            self.assertIsNone(it_ref())
+            self.assertIsNone(loader_ref())
             time.sleep(0.05)
 
-        make_and_destroy_loader()
+        run_loader_once()
         baseline_fds = proc.num_fds()
         for _ in range(15):
-            make_and_destroy_loader()
+            run_loader_once()
         after_fds = proc.num_fds()
         self.assertLessEqual(after_fds, baseline_fds + 8)
+
+    def test_shutdown_workers_skips_wrong_pid_iterators(self):
+        it = object.__new__(dataloader._MultiProcessingDataLoaderIter)
+        it._shutdown_owner_pid = -1
+        it._shutdown = False
+
+        dataloader._MultiProcessingDataLoaderIter._shutdown_workers(it)
+
+        self.assertFalse(it._shutdown)
+
+    @unittest.skipIf(IS_WINDOWS, "Needs fork")
+    def test_persistent_workers_atexit_state_resets_after_fork(self):
+        import threading
+        import weakref
+
+        class Holder:
+            pass
+
+        ctx = mp.get_context("fork")
+        reader, writer = ctx.Pipe(duplex=False)
+        holder = Holder()
+
+        with (
+            mock.patch.object(
+                dataloader, "_persistent_workers_atexit_lock", threading.Lock()
+            ),
+            mock.patch.object(dataloader, "_persistent_workers_atexit_registered", True),
+            mock.patch.object(
+                dataloader, "_persistent_workers_atexit", weakref.WeakSet([holder])
+            ),
+        ):
+            dataloader._persistent_workers_atexit_lock.acquire()
+            proc = ctx.Process(
+                target=_test_persistent_workers_atexit_state_resets_after_fork,
+                args=(writer,),
+            )
+
+            try:
+                proc.start()
+                proc.join(JOIN_TIMEOUT)
+                self.assertFalse(proc.is_alive())
+                self.assertEqual(proc.exitcode, 0)
+                self.assertTrue(reader.poll())
+                self.assertEqual(reader.recv(), 0)
+            finally:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join()
+                dataloader._persistent_workers_atexit_lock.release()
 
     def test_dataset_not_reset(self):
         dataset = DummyDataset()
